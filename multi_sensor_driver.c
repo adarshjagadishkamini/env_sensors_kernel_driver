@@ -22,9 +22,10 @@ static struct i2c_client *ms_i2c_client;
 static struct workqueue_struct *ms_wq;
 static struct work_struct ms_work;
 
-#define GPIO_INTERRUPT_PIN 23
-#define GPIO_LED_PIN 24
+/* GPIO pins will be obtained from Device Tree */
 static int irq_number;
+static int led_gpio;
+static int interrupt_gpio;
 
 /* BME680 Registers */
 #define BME680_ADDR                0x76  /* I2C address of BME680 */
@@ -61,7 +62,7 @@ static int irq_number;
 #define BME680_FORCED_MODE         0x01
 
 static const struct of_device_id ms_of_match[] = {
-    { .compatible = "packt,multi-sensor", },
+    { .compatible = "bosch,bme680", },
     { }
 };
 
@@ -568,7 +569,7 @@ static struct file_operations fops = {
 static int ms_i2c_probe(struct i2c_client *client, const struct i2c_device_id *id)
 {
     struct device_node *np = client->dev.of_node;
-    int led_gpio, interrupt_gpio;
+    int local_led_gpio, local_interrupt_gpio;
     struct ms_private_data *dev_data;
 
     if (!np) {
@@ -576,40 +577,40 @@ static int ms_i2c_probe(struct i2c_client *client, const struct i2c_device_id *i
         return -EINVAL;
     }
 
-    led_gpio = of_get_named_gpio(np, "led-gpios", 0);
-    if (led_gpio < 0) {
+    local_led_gpio = of_get_named_gpio(np, "led-gpios", 0);
+    if (local_led_gpio < 0) {
         pr_err("Failed to get LED GPIO from device tree\n");
-        return led_gpio;
+        return local_led_gpio;
     }
 
-    interrupt_gpio = of_get_named_gpio(np, "interrupt-gpios", 0);
-    if (interrupt_gpio < 0) {
+    local_interrupt_gpio = of_get_named_gpio(np, "interrupt-gpios", 0);
+    if (local_interrupt_gpio < 0) {
         pr_err("Failed to get interrupt GPIO from device tree\n");
-        return interrupt_gpio;
+        return local_interrupt_gpio;
     }
 
-    pr_info("LED GPIO: %d, Interrupt GPIO: %d\n", led_gpio, interrupt_gpio);
+    pr_info("LED GPIO: %d, Interrupt GPIO: %d\n", local_led_gpio, local_interrupt_gpio);
 
     /* GPIO and Interrupt setup */
-    if (gpio_request(led_gpio, "led-pin")) {
+    if (gpio_request(local_led_gpio, "led-pin")) {
         pr_err("Failed to request LED GPIO pin\n");
         return -EFAULT;
     }
-    gpio_direction_output(led_gpio, 0);
+    gpio_direction_output(local_led_gpio, 0);
 
-    if (gpio_request(interrupt_gpio, "interrupt-pin")) {
+    if (gpio_request(local_interrupt_gpio, "interrupt-pin")) {
         pr_err("Failed to request Interrupt GPIO pin\n");
-        gpio_free(led_gpio);
+        gpio_free(local_led_gpio);
         return -EFAULT;
     }
-    gpio_direction_input(interrupt_gpio);
+    gpio_direction_input(local_interrupt_gpio);
 
     /* Allocate private data for the I2C client */
     dev_data = devm_kzalloc(&client->dev, sizeof(struct ms_private_data), GFP_KERNEL);
     if (!dev_data) {
         pr_err("Failed to allocate memory for private data\n");
-        gpio_free(interrupt_gpio);
-        gpio_free(led_gpio);
+        gpio_free(local_interrupt_gpio);
+        gpio_free(local_led_gpio);
         return -ENOMEM;
     }
 
@@ -621,13 +622,17 @@ static int ms_i2c_probe(struct i2c_client *client, const struct i2c_device_id *i
     i2c_set_clientdata(client, dev_data);
 
     /* Set up interrupt handler */
-    irq_number = gpio_to_irq(interrupt_gpio);
+    irq_number = gpio_to_irq(local_interrupt_gpio);
     if (request_irq(irq_number, gpio_irq_handler, IRQF_TRIGGER_RISING, DRIVER_NAME, dev_data)) {
         pr_err("Failed to request IRQ\n");
-        gpio_free(interrupt_gpio);
-        gpio_free(led_gpio);
+        gpio_free(local_interrupt_gpio);
+        gpio_free(local_led_gpio);
         return -EFAULT;
     }
+
+    /* Store GPIO pins globally for cleanup in exit function */
+    led_gpio = local_led_gpio;
+    interrupt_gpio = local_interrupt_gpio;
 
     pr_info("GPIO and Interrupts initialized from DT\n");
 
@@ -721,8 +726,12 @@ static void __exit multi_sensor_exit(void)
     if (irq_number) {
         free_irq(irq_number, NULL);
     }
-    gpio_free(GPIO_INTERRUPT_PIN);
-    gpio_free(GPIO_LED_PIN);
+    if (interrupt_gpio) {
+        gpio_free(interrupt_gpio);
+    }
+    if (led_gpio) {
+        gpio_free(led_gpio);
+    }
 
     /* Cancel any pending work */
     if (ms_wq) {
